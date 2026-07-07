@@ -62,28 +62,46 @@ class Order:
     remaining: int = -1  # sentinel; set to quantity in __post_init__
     active: bool = True  # False once cancelled (lazy deletion from the book)
     post_only: bool = False  # maker-only: reject instead of crossing
+    owner: str | None = None   # participant id, for self-trade prevention
+    display: int | None = None  # iceberg: visible tranche size (None = lit)
+    visible: int = -1  # open qty currently displayed; managed by the engine
 
     def __post_init__(self) -> None:
+        # exact-type checks (`type(x) is int`) reject bool for free, since
+        # type(True) is bool, and are faster than isinstance chains — Order
+        # construction is on the hot path.
         if not self.order_id:
             raise ValueError("order_id must be a non-empty string")
         if not isinstance(self.side, Side):
             raise TypeError(f"side must be a Side, got {type(self.side).__name__}")
-        # bool is a subclass of int, so exclude it explicitly.
-        for name, value in (("price", self.price), ("quantity", self.quantity)):
-            if name == "price" and value is None:
-                continue  # market order
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{name} must be an int (ticks), got {type(value).__name__}")
-        if self.price is not None and self.price <= 0:
-            raise ValueError(f"price must be positive, got {self.price}")
-        if self.quantity <= 0:
-            raise ValueError(f"quantity must be positive, got {self.quantity}")
+        price = self.price
+        if price is not None:
+            if type(price) is not int:
+                raise TypeError(
+                    f"price must be an int (ticks), got {type(price).__name__}")
+            if price <= 0:
+                raise ValueError(f"price must be positive, got {price}")
+        qty = self.quantity
+        if type(qty) is not int:
+            raise TypeError(
+                f"quantity must be an int (ticks), got {type(qty).__name__}")
+        if qty <= 0:
+            raise ValueError(f"quantity must be positive, got {qty}")
         if self.remaining == -1:
-            self.remaining = self.quantity
-        elif not (0 <= self.remaining <= self.quantity):
+            self.remaining = qty
+        elif not (0 <= self.remaining <= qty):
             raise ValueError(
                 f"remaining must be within [0, quantity], got {self.remaining}"
             )
+        display = self.display
+        if display is not None:
+            if type(display) is not int:
+                raise TypeError("display must be an int")
+            if display <= 0:
+                raise ValueError("display must be positive")
+        if self.visible == -1:
+            self.visible = (min(display, self.remaining)
+                            if display is not None else self.remaining)
 
     @property
     def is_market(self) -> bool:

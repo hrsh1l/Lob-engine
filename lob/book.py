@@ -52,8 +52,10 @@ class PriceLevel:
         self.total_qty = 0
 
     def append(self, order: Order) -> None:
+        # depth counts only the *displayed* quantity: an iceberg's hidden
+        # reserve is invisible to the market, exactly like a real venue
         self.orders.append(order)
-        self.total_qty += order.remaining
+        self.total_qty += order.visible
 
     def reduce(self, qty: int) -> None:
         """Account for `qty` units removed from this level (fill/cancel)."""

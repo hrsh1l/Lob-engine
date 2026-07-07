@@ -5,9 +5,12 @@ Price-time priority, single instrument, designed so multi-instrument is a
 `dict[symbol, MatchingEngine]` away.
 
 Order types: limit (GTC/IOC/FOK, optional post-only), market, stop-market,
-stop-limit (with cascade triggering off the last-trade price). The engine
-enforces configurable tick and lot sizes, and every fill carries a
-monotonic trade id and the aggressor side, like a real execution feed.
+stop-limit (with cascade triggering off the last-trade price), and iceberg
+(`display=` shows only a tranche; reloads rejoin the back of the queue).
+Optional self-trade prevention (`stp="cancel_resting"` or
+`"cancel_incoming"`, keyed on `Order.owner`). The engine enforces
+configurable tick and lot sizes, and every fill carries a monotonic trade
+id and the aggressor side, like a real execution feed.
 
 `python gui.py` opens an interactive front-end: order entry, live book
 ladder, last-trade chart, time & sales tape colored by aggressor, session

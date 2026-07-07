@@ -114,7 +114,7 @@ def assert_invariants(tc, eng):
     for side in (eng.book.bids, eng.book.asks):
         prev = None
         for level in side.levels_best_first():
-            live = sum(o.remaining for o in level.orders if o.active)
+            live = sum(o.visible for o in level.orders if o.active)
             tc.assertEqual(level.total_qty, live,
                            f"level {level.price} qty accounting drifted")
             tc.assertGreater(level.total_qty, 0, "empty level not removed")

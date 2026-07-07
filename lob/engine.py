@@ -44,7 +44,7 @@ from lob.types import Fill, Order, Side, TimeInForce
 
 
 class MatchingEngine:
-    __slots__ = ("book", "events", "tick_size", "lot_size",
+    __slots__ = ("book", "events", "tick_size", "lot_size", "stp",
                  "last_trade_price", "_orders", "_stops", "_on_event",
                  "_next_trade_id")
 
@@ -53,13 +53,21 @@ class MatchingEngine:
         on_event: Optional[Callable[[Event], None]] = None,
         tick_size: int = 1,
         lot_size: int = 1,
+        stp: str = "off",
     ) -> None:
+        """`stp` (self-trade prevention, applied when both orders carry the
+        same non-None owner): "off", "cancel_resting" (cancel the maker and
+        keep matching), or "cancel_incoming" (cancel the taker's remainder).
+        """
         if tick_size < 1 or lot_size < 1:
             raise ValueError("tick_size and lot_size must be >= 1")
+        if stp not in ("off", "cancel_resting", "cancel_incoming"):
+            raise ValueError(f"unknown stp policy {stp!r}")
         self.book = OrderBook()
         self.events: list[Event] = []
         self.tick_size = tick_size
         self.lot_size = lot_size
+        self.stp = stp
         self.last_trade_price: Optional[int] = None
         self._orders: dict[str, Order] = {}  # open (resting) orders by id
         self._stops: dict[str, tuple[Order, int]] = {}  # id -> (order, stop px)
@@ -92,17 +100,23 @@ class MatchingEngine:
 
         fills = self._match(order, limit_price=order.price)
 
-        if order.is_filled:
-            pass  # nothing rests, nothing to track
+        if order.is_filled or not order.active:
+            pass  # fully done, or STP cancelled the incoming remainder
         elif tif is TimeInForce.GTC:
-            self.book.side(order.side).add(order)
-            self._orders[order.order_id] = order
-            self._emit(Ack(order.order_id, order.side, order.price, order.remaining))
+            self._rest(order)
         else:  # IOC (or FOK that matched fully above — can't reach here unfilled)
             self._emit(Canceled(order.order_id, order.remaining, "ioc_expired"))
         if fills:
             self._check_stops()
         return fills
+
+    def _rest(self, order: Order) -> None:
+        """Place a (possibly partially filled) limit order on the book."""
+        order.visible = (min(order.display, order.remaining)
+                         if order.display is not None else order.remaining)
+        self.book.side(order.side).add(order)
+        self._orders[order.order_id] = order
+        self._emit(Ack(order.order_id, order.side, order.price, order.remaining))
 
     def submit_market(self, order: Order) -> list[Fill]:
         """Match immediately at any price; cancel whatever can't fill."""
@@ -111,7 +125,7 @@ class MatchingEngine:
         if not self._admit(order):
             return []
         fills = self._match(order, limit_price=None)
-        if not order.is_filled:
+        if not order.is_filled and order.active:
             self._emit(Canceled(order.order_id, order.remaining, "market_unfilled"))
         if fills:
             self._check_stops()
@@ -162,7 +176,7 @@ class MatchingEngine:
         order.active = False
         side = self.book.side(order.side)
         level = side.level_at(order.price)
-        level.reduce(order.remaining)
+        level.reduce(order.visible)  # only the displayed part is on the level
         if level.total_qty == 0:
             # every order left in the deque is dead; drop the whole level
             level.orders.clear()
@@ -196,8 +210,10 @@ class MatchingEngine:
 
         if not price_change and target_qty < order.remaining:
             level = self.book.side(order.side).level_at(order.price)
-            level.reduce(order.remaining - target_qty)
+            old_visible = order.visible
             order.remaining = target_qty
+            order.visible = min(old_visible, target_qty)
+            level.reduce(old_visible - order.visible)
             self._emit(Modified(order_id, order.price, target_qty))
             return True
         if not price_change and target_qty == order.remaining:
@@ -206,7 +222,9 @@ class MatchingEngine:
         # Priority-losing modify: cancel, then re-enter as a brand-new order.
         price = new_price if new_price is not None else order.price
         self.cancel(order_id, reason="modify")
-        replacement = Order(order_id, order.side, price=price, quantity=target_qty)
+        replacement = Order(order_id, order.side, price=price,
+                            quantity=target_qty, owner=order.owner,
+                            display=order.display)
         self.submit_limit(replacement)  # may match if the new price crosses
         return True
 
@@ -300,16 +318,13 @@ class MatchingEngine:
                 self._emit(Triggered(oid, stop_px))
                 if order.is_market:
                     self._match(order, limit_price=None)
-                    if not order.is_filled:
+                    if not order.is_filled and order.active:
                         self._emit(Canceled(oid, order.remaining,
                                             "market_unfilled"))
                 else:
                     self._match(order, limit_price=order.price)
-                    if not order.is_filled:
-                        self.book.side(order.side).add(order)
-                        self._orders[oid] = order
-                        self._emit(Ack(oid, order.side, order.price,
-                                       order.remaining))
+                    if not order.is_filled and order.active:
+                        self._rest(order)
 
     def _fillable(self, order: Order) -> bool:
         """FOK pre-check: can `order` trade its full size immediately?"""
@@ -348,8 +363,23 @@ class MatchingEngine:
                 if not maker.active:
                     level.orders.popleft()  # skim a lazily-cancelled order
                     continue
-                qty = min(taker.remaining, maker.remaining)
+                if (self.stp != "off" and taker.owner is not None
+                        and maker.owner == taker.owner):
+                    if self.stp == "cancel_resting":
+                        maker.active = False
+                        level.orders.popleft()
+                        level.reduce(maker.visible)
+                        del self._orders[maker.order_id]
+                        self._emit(Canceled(maker.order_id, maker.remaining,
+                                            "stp"))
+                        continue
+                    # cancel_incoming: kill the taker's remainder, stop here
+                    taker.active = False
+                    self._emit(Canceled(taker.order_id, taker.remaining, "stp"))
+                    break
+                qty = min(taker.remaining, maker.visible)
                 maker.fill(qty)
+                maker.visible -= qty
                 taker.fill(qty)
                 level.reduce(qty)
                 self._next_trade_id += 1
@@ -367,6 +397,17 @@ class MatchingEngine:
                 if maker.is_filled:
                     level.orders.popleft()
                     del self._orders[maker.order_id]
+                elif maker.visible == 0:
+                    # iceberg tranche exhausted: reload from the hidden
+                    # reserve and rejoin the BACK of the queue (real
+                    # iceberg semantics — each tranche re-earns priority)
+                    level.orders.popleft()
+                    maker.visible = min(maker.display, maker.remaining)
+                    level.orders.append(maker)
+                    level.total_qty += maker.visible
+
+            if not taker.active:
+                break  # STP cancelled the incoming order
 
             # Sweep on live quantity, not deque emptiness: the taker may
             # stop mid-level leaving only lazily-cancelled orders behind,
