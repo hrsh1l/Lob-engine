@@ -46,7 +46,7 @@ from lob.types import Fill, Order, Side, TimeInForce
 class MatchingEngine:
     __slots__ = ("book", "events", "tick_size", "lot_size", "stp",
                  "last_trade_price", "_orders", "_stops", "_on_event",
-                 "_next_trade_id")
+                 "_next_trade_id", "in_auction", "_auction")
 
     def __init__(
         self,
@@ -73,6 +73,8 @@ class MatchingEngine:
         self._stops: dict[str, tuple[Order, int]] = {}  # id -> (order, stop px)
         self._on_event = on_event
         self._next_trade_id = 0
+        self.in_auction = False
+        self._auction: dict[str, tuple[Order, TimeInForce]] = {}
 
     # ------------------------------------------------------------------ #
     # order entry
@@ -89,6 +91,11 @@ class MatchingEngine:
         if order.is_market:
             raise ValueError("market orders go through submit_market()")
         if not self._admit(order):
+            return []
+        if self.in_auction:
+            self._auction[order.order_id] = (order, tif)
+            self._emit(Ack(order.order_id, order.side, order.price,
+                           order.remaining))
             return []
 
         if order.post_only and self._would_cross(order):
@@ -123,6 +130,10 @@ class MatchingEngine:
         if not order.is_market:
             raise ValueError("submit_market() requires an order with price=None")
         if not self._admit(order):
+            return []
+        if self.in_auction:
+            # market orders join the auction with top execution priority
+            self._auction[order.order_id] = (order, TimeInForce.IOC)
             return []
         fills = self._match(order, limit_price=None)
         if not order.is_filled and order.active:
@@ -169,6 +180,10 @@ class MatchingEngine:
         stop = self._stops.pop(order_id, None)
         if stop is not None:
             self._emit(Canceled(order_id, stop[0].remaining, reason))
+            return True
+        parked = self._auction.pop(order_id, None)
+        if parked is not None:
+            self._emit(Canceled(order_id, parked[0].remaining, reason))
             return True
         order = self._orders.pop(order_id, None)
         if order is None:
